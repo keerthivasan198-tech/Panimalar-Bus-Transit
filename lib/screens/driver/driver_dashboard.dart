@@ -161,6 +161,18 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
   StreamSubscription? _dynamicRoutesSub;
   StreamSubscription? _dynamicDriversSub;
 
+  // Dynamic GPS Alarm & Watchdog State
+  Timer? _gpsAlarmWatchdogTimer;
+  Timer? _gpsAlarmAudioLoopTimer;
+  bool _isGpsAlarmRinging = false;
+  DateTime? _gpsAlarmSnoozedUntil;
+  final Map<String, dynamic> _dynamicShiftSchedule = {};
+  StreamSubscription? _dynamicShiftSub;
+  StreamSubscription? _driverShiftSub;
+  StreamSubscription? _adminShiftSub;
+  bool _gpsAlarmGlobalEnabled = true;
+  String _activeAlarmShiftName = "";
+
   String _extractBusNumber(String input) {
     if (input.isEmpty) return '';
     final match = RegExp(r'(?:[Rr]oute|[Bb]us)?\s*[-_]?\s*(\d+)').firstMatch(input);
@@ -182,11 +194,13 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
     _initTtsAudio();
     _loadRouteDetails();
     _listenForDynamicRouteChanges();
+    _listenForDynamicShiftSchedule();
     _startFirebaseConnectedListener();
     _listenForConfirmedPickups();
     _listenForIntercomMessages();
     _listenForAdminSettings();
     _restoreTrackingState();
+    _startGpsAlarmWatchdog();
   }
 
   void _initTtsAudio() async {
@@ -722,6 +736,215 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
     }
   }
 
+  void _listenForDynamicShiftSchedule() {
+    _dynamicShiftSub?.cancel();
+    _driverShiftSub?.cancel();
+    _adminShiftSub?.cancel();
+    if (Firebase.apps.isEmpty) return;
+
+    try {
+      // 1. Listen for Global Admin Settings
+      _adminShiftSub = FirebaseDatabase.instance.ref('adminSettings').onValue.listen((event) {
+        if (!mounted) return;
+        final data = event.snapshot.value;
+        if (data is Map) {
+          setState(() {
+            if (data['gps_alarm_enabled'] != null) {
+              _gpsAlarmGlobalEnabled = data['gps_alarm_enabled'] == true || data['gps_alarm_enabled'].toString() == 'true';
+            }
+            if (data['default_shifts'] is Map) {
+              final defShifts = Map<String, dynamic>.from(data['default_shifts'] as Map);
+              defShifts.forEach((key, val) {
+                if (!_dynamicShiftSchedule.containsKey(key)) {
+                  _dynamicShiftSchedule[key] = val;
+                }
+              });
+            }
+          });
+        }
+      });
+
+      // 2. Listen for Route specific shift timings
+      _dynamicShiftSub = FirebaseDatabase.instance.ref('routes/$_routeKey').onValue.listen((event) {
+        if (!mounted) return;
+        final data = event.snapshot.value;
+        if (data is Map) {
+          setState(() {
+            if (data['morning_start'] != null) _dynamicShiftSchedule['morning_start'] = data['morning_start'];
+            if (data['morning_end'] != null) _dynamicShiftSchedule['morning_end'] = data['morning_end'];
+            if (data['evening_start'] != null) _dynamicShiftSchedule['evening_start'] = data['evening_start'];
+            if (data['evening_end'] != null) _dynamicShiftSchedule['evening_end'] = data['evening_end'];
+            if (data['morningStart'] != null) _dynamicShiftSchedule['morning_start'] = data['morningStart'];
+            if (data['morningEnd'] != null) _dynamicShiftSchedule['morning_end'] = data['morningEnd'];
+            if (data['eveningStart'] != null) _dynamicShiftSchedule['evening_start'] = data['eveningStart'];
+            if (data['eveningEnd'] != null) _dynamicShiftSchedule['evening_end'] = data['eveningEnd'];
+            if (data['active_days'] != null) _dynamicShiftSchedule['active_days'] = data['active_days'];
+          });
+        }
+      });
+
+      // 3. Listen for Driver specific shift timings
+      _driverShiftSub = FirebaseDatabase.instance.ref('drivers/${widget.driverBus}').onValue.listen((event) {
+        if (!mounted) return;
+        final data = event.snapshot.value;
+        if (data is Map) {
+          setState(() {
+            if (data['morning_start'] != null) _dynamicShiftSchedule['morning_start'] = data['morning_start'];
+            if (data['morning_end'] != null) _dynamicShiftSchedule['morning_end'] = data['morning_end'];
+            if (data['evening_start'] != null) _dynamicShiftSchedule['evening_start'] = data['evening_start'];
+            if (data['evening_end'] != null) _dynamicShiftSchedule['evening_end'] = data['evening_end'];
+            if (data['active_days'] != null) _dynamicShiftSchedule['active_days'] = data['active_days'];
+          });
+        }
+      });
+    } catch (e) {
+      debugPrint("Error listening to dynamic shift schedule: $e");
+    }
+  }
+
+  int? _parseTimeToMinutes(dynamic timeInput) {
+    if (timeInput == null) return null;
+    final str = timeInput.toString().trim().toUpperCase();
+    if (str.isEmpty) return null;
+
+    try {
+      final isPm = str.contains('PM');
+      final isAm = str.contains('AM');
+      final cleanStr = str.replaceAll('AM', '').replaceAll('PM', '').trim();
+      final parts = cleanStr.split(':');
+      if (parts.length >= 2) {
+        int hour = int.parse(parts[0].trim());
+        int minute = int.parse(parts[1].trim());
+        if (isPm && hour < 12) hour += 12;
+        if (isAm && hour == 12) hour = 0;
+        return hour * 60 + minute;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  String? _getCurrentActiveShift() {
+    final now = DateTime.now();
+    final weekday = now.weekday; // 1 = Mon, 7 = Sun
+
+    final activeDays = _dynamicShiftSchedule['active_days'];
+    if (activeDays != null) {
+      if (activeDays is List && !activeDays.contains(weekday) && !activeDays.contains(weekday.toString())) {
+        return null;
+      } else if (activeDays is String && !activeDays.contains(weekday.toString())) {
+        return null;
+      }
+    } else {
+      if (weekday == DateTime.sunday) {
+        return null;
+      }
+    }
+
+    final currentMinutes = now.hour * 60 + now.minute;
+
+    // Morning shift default: 06:00 (360) to 08:45 (525)
+    final morningStart = _parseTimeToMinutes(_dynamicShiftSchedule['morning_start']) ?? (6 * 60);
+    final morningEnd = _parseTimeToMinutes(_dynamicShiftSchedule['morning_end']) ?? (8 * 60 + 45);
+
+    if (currentMinutes >= morningStart && currentMinutes <= morningEnd) {
+      return "Morning Shift";
+    }
+
+    // Evening shift default: 15:00 (900) to 17:45 (1065)
+    final eveningStart = _parseTimeToMinutes(_dynamicShiftSchedule['evening_start']) ?? (15 * 60);
+    final eveningEnd = _parseTimeToMinutes(_dynamicShiftSchedule['evening_end']) ?? (17 * 60 + 45);
+
+    if (currentMinutes >= eveningStart && currentMinutes <= eveningEnd) {
+      return "Evening Shift";
+    }
+
+    return null;
+  }
+
+  void _startGpsAlarmWatchdog() {
+    _gpsAlarmWatchdogTimer?.cancel();
+    _gpsAlarmWatchdogTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
+      if (!mounted) return;
+
+      if (!_gpsAlarmGlobalEnabled || _isTracking || _isParked || _breakdownActive) {
+        if (_isGpsAlarmRinging) {
+          _dismissGpsAlarm();
+        }
+        return;
+      }
+
+      if (_gpsAlarmSnoozedUntil != null && DateTime.now().isBefore(_gpsAlarmSnoozedUntil!)) {
+        if (_isGpsAlarmRinging) {
+          _dismissGpsAlarm();
+        }
+        return;
+      }
+
+      final activeShift = _getCurrentActiveShift();
+      if (activeShift != null) {
+        _activeAlarmShiftName = activeShift;
+        if (!_isGpsAlarmRinging) {
+          _triggerGpsAlarm(activeShift);
+        }
+      } else {
+        if (_isGpsAlarmRinging) {
+          _dismissGpsAlarm();
+        }
+      }
+    });
+  }
+
+  void _triggerGpsAlarm(String shiftName) {
+    if (!mounted) return;
+    setState(() {
+      _isGpsAlarmRinging = true;
+      _activeAlarmShiftName = shiftName;
+    });
+
+    _playGpsAlarmAlert();
+
+    _gpsAlarmAudioLoopTimer?.cancel();
+    _gpsAlarmAudioLoopTimer = Timer.periodic(const Duration(seconds: 12), (timer) {
+      if (!mounted || !_isGpsAlarmRinging || _isTracking || _isParked) {
+        timer.cancel();
+        return;
+      }
+      _playGpsAlarmAlert();
+    });
+  }
+
+  void _playGpsAlarmAlert() {
+    try {
+      HapticFeedback.heavyImpact();
+    } catch (_) {}
+
+    final bool isTamil = widget.currentLang == 'ta';
+    final String speechText = isTamil
+        ? "கவனம்! பயண நேரம் தொடங்கிவிட்டது. தயவுசெய்து GPS டிராக்கிங்கை உடனே ஆன் செய்யவும்."
+        : "Attention! Active travel shift has started. Please start GPS tracking immediately.";
+    final String fallbackText = "G P S tracking on pannunga.";
+
+    _speakTamilVoiceMessage(speechText, fallbackText);
+  }
+
+  void _dismissGpsAlarm() {
+    _gpsAlarmAudioLoopTimer?.cancel();
+    _gpsAlarmAudioLoopTimer = null;
+    if (_isGpsAlarmRinging && mounted) {
+      setState(() {
+        _isGpsAlarmRinging = false;
+      });
+    }
+  }
+
+  void _snoozeGpsAlarm() {
+    _dismissGpsAlarm();
+    setState(() {
+      _gpsAlarmSnoozedUntil = DateTime.now().add(const Duration(minutes: 5));
+    });
+    _showSnackBar("⏰ GPS Alarm snoozed for 5 minutes");
+  }
+
   void _fetchAndSendLocation() async {
     bool serviceEnabled;
     LocationPermission permission;
@@ -895,6 +1118,11 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
     _recordingTimer?.cancel();
     _playbackTimer?.cancel();
     _parkedLocationTimer?.cancel();
+    _gpsAlarmWatchdogTimer?.cancel();
+    _gpsAlarmAudioLoopTimer?.cancel();
+    _dynamicShiftSub?.cancel();
+    _driverShiftSub?.cancel();
+    _adminShiftSub?.cancel();
     _replacementController.dispose();
     _intercomSub?.cancel();
     _driverChatInputCtrl.dispose();
@@ -1544,6 +1772,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
   }
 
   void _startTracking({bool isRestoring = false, bool restoreBreakdown = false}) async {
+    _dismissGpsAlarm();
     setState(() {
       _isTracking = true;
       _isParked = false;
@@ -1961,6 +2190,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
 
   void _parkBus() async {
     if (!mounted) return;
+    _dismissGpsAlarm();
     setState(() {
       _isParked = true;
       _breakdownActive = false;
@@ -3807,6 +4037,122 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                       ],
                     ),
                     const SizedBox(height: 16),
+                    if (_isGpsAlarmRinging) ...[
+                      Container(
+                        margin: const EdgeInsets.only(bottom: 16),
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFEF2F2),
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(color: const Color(0xFFEF4444), width: 2),
+                          boxShadow: [
+                            BoxShadow(
+                              color: const Color(0xFFEF4444).withValues(alpha: 0.25),
+                              blurRadius: 12,
+                              offset: const Offset(0, 4),
+                            ),
+                          ],
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(8),
+                                  decoration: const BoxDecoration(
+                                    color: Color(0xFFEF4444),
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: const Icon(
+                                    Icons.warning_amber_rounded,
+                                    color: Colors.white,
+                                    size: 26,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        t('gpsAlarmTitle'),
+                                        style: const TextStyle(
+                                          fontSize: 15,
+                                          fontWeight: FontWeight.w900,
+                                          color: Color(0xFFB91C1C),
+                                          letterSpacing: 0.3,
+                                        ),
+                                      ),
+                                      if (_activeAlarmShiftName.isNotEmpty)
+                                        Text(
+                                          _activeAlarmShiftName,
+                                          style: const TextStyle(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w700,
+                                            color: Color(0xFFDC2626),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 10),
+                            Text(
+                              t('gpsAlarmMsg'),
+                              style: const TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                                color: Color(0xFF475569),
+                                height: 1.35,
+                              ),
+                            ),
+                            const SizedBox(height: 14),
+                            Row(
+                              children: [
+                                Expanded(
+                                  flex: 3,
+                                  child: ElevatedButton.icon(
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: const Color(0xFFDC2626),
+                                      foregroundColor: Colors.white,
+                                      padding: const EdgeInsets.symmetric(vertical: 13),
+                                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                                      elevation: 3,
+                                    ),
+                                    icon: const Icon(Icons.play_arrow_rounded, color: Colors.white, size: 22),
+                                    label: Text(
+                                      t('startGpsNow'),
+                                      style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 13),
+                                    ),
+                                    onPressed: () => _startTracking(),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  flex: 2,
+                                  child: OutlinedButton.icon(
+                                    style: OutlinedButton.styleFrom(
+                                      foregroundColor: const Color(0xFF64748B),
+                                      side: const BorderSide(color: Color(0xFFCBD5E1), width: 1.5),
+                                      padding: const EdgeInsets.symmetric(vertical: 13),
+                                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                                    ),
+                                    icon: const Icon(Icons.snooze_rounded, size: 18),
+                                    label: Text(
+                                      t('snooze5Mins'),
+                                      style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 12),
+                                    ),
+                                    onPressed: _snoozeGpsAlarm,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                     // Trip Direction Toggle (1 = Blue [To College], 2 = Orange [To Home])
                     Container(
                       decoration: BoxDecoration(

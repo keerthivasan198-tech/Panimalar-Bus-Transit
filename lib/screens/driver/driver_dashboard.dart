@@ -842,9 +842,9 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
 
     final currentMinutes = now.hour * 60 + now.minute;
 
-    // Morning shift default: 06:00 (360) to 08:45 (525)
+    // Morning shift default: 06:00 (360) to 07:45 (465)
     final morningStart = _parseTimeToMinutes(_dynamicShiftSchedule['morning_start']) ?? (6 * 60);
-    final morningEnd = _parseTimeToMinutes(_dynamicShiftSchedule['morning_end']) ?? (8 * 60 + 45);
+    final morningEnd = _parseTimeToMinutes(_dynamicShiftSchedule['morning_end']) ?? (7 * 60 + 45);
 
     if (currentMinutes >= morningStart && currentMinutes <= morningEnd) {
       return "Morning Shift";

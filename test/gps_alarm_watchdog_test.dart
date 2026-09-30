@@ -50,9 +50,9 @@ class GpsAlarmWatchdogEngine {
 
     final currentMinutes = now.hour * 60 + now.minute;
 
-    // Morning shift default: 06:00 (360) to 08:45 (525)
+    // Morning shift default: 06:00 (360) to 07:45 (465)
     final morningStart = parseTimeToMinutes(dynamicShiftSchedule['morning_start']) ?? (6 * 60);
-    final morningEnd = parseTimeToMinutes(dynamicShiftSchedule['morning_end']) ?? (8 * 60 + 45);
+    final morningEnd = parseTimeToMinutes(dynamicShiftSchedule['morning_end']) ?? (7 * 60 + 45);
 
     if (currentMinutes >= morningStart && currentMinutes <= morningEnd) {
       return "Morning Shift";
@@ -135,10 +135,14 @@ void main() {
       expect(engine.parseTimeToMinutes(null), isNull);
     });
 
-    test('Identifies default morning shift (06:00 to 08:45) on Monday', () {
+    test('Identifies default morning shift (06:00 to 07:45) on Monday', () {
       // 2026-10-05 is a Monday
       final morningTime = DateTime(2026, 10, 5, 7, 15);
       expect(engine.getCurrentActiveShift(morningTime), "Morning Shift");
+
+      // 08:00 AM is now outside the morning shift
+      final afterMorning = DateTime(2026, 10, 5, 8, 0);
+      expect(engine.getCurrentActiveShift(afterMorning), isNull);
     });
 
     test('Identifies default evening shift (15:00 to 17:45) on Friday', () {
